@@ -1,72 +1,102 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import yfinance as yf
+import plotly.graph_objects as go
+from textblob import TextBlob
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import BollingerBands
 
 # Helper function to preprocess and feature engineer the dataset
 def process_data(df):
-    # Standardize column names
-    df.columns = df.columns.astype(str).str.strip().str.upper()
-
-    # Identify essential columns
-    date_col = next((col for col in df.columns if 'DATE' in col), None)
-    close_col = next((col for col in df.columns if 'CLOSE' in col), None)
-    
-    if not close_col:
-        st.error("The dataset must contain a column for closing price (e.g., 'Close', 'Close Price').")
-        st.stop()
-    
-    if date_col:
+    # Ensure index is datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
         try:
-            df[date_col] = pd.to_datetime(df[date_col], infer_datetime_format=True)
-            df = df.sort_values(by=date_col)
-            # Set Date as index for plotting
-            df.set_index(date_col, inplace=True)
+            df.index = pd.to_datetime(df.index, infer_datetime_format=True)
         except Exception as e:
-            st.warning(f"Could not parse dates properly from '{date_col}': {e}")
-    else:
-         st.warning("No Date column found. Proceeding using row index/order.")
-
-    # Remove extra spaces or handle string-encoded numbers in close price
-    if df[close_col].dtype == object:
-        df[close_col] = df[close_col].str.replace(',', '').astype(float)
+            st.warning(f"Could not parse dates from index: {e}")
     
+    # Identify close column (yfinance uses Capitalized like 'Close')
+    close_col = 'Close'
+    if close_col not in df.columns:
+        close_col = next((col for col in df.columns if 'CLOSE' in col.upper()), None)
+        if not close_col:
+            st.error("The dataset must contain a 'Close' column.")
+            st.stop()
+
     # Handle missing values
     df = df.dropna(subset=[close_col])
     
     # Generate Target Column: 1 if Next Day Close > Current Day Close, else 0
     df['Target'] = (df[close_col].shift(-1) > df[close_col]).astype(int)
-    # The last row's Target will technically be False (0) because shift(-1) is NaN.
     
-    # Create simple Technical Indicators as Features
+    # Technical Indicators as Features
     df['SMA_10'] = df[close_col].rolling(window=10).mean()
     df['SMA_30'] = df[close_col].rolling(window=30).mean()
     df['Returns'] = df[close_col].pct_change()
     
-    # Drop rows with NaN introduced by rolling/shifting except the last row
-    # We only drop rows where our features are NaN
-    df = df.dropna(subset=['SMA_10', 'SMA_30', 'Returns', close_col])
+    # Add new indicators using 'ta' library
+    rsi_indicator = RSIIndicator(close=df[close_col], window=14)
+    df['RSI_14'] = rsi_indicator.rsi()
+    
+    macd_indicator = MACD(close=df[close_col])
+    df['MACD'] = macd_indicator.macd()
+    df['MACD_Signal'] = macd_indicator.macd_signal()
+    
+    bb_indicator = BollingerBands(close=df[close_col], window=20, window_dev=2)
+    df['BB_High'] = bb_indicator.bollinger_hband()
+    df['BB_Low'] = bb_indicator.bollinger_lband()
+    
+    # Drop rows with NaN introduced by rolling/shifting
+    features_to_check = ['SMA_10', 'SMA_30', 'Returns', 'RSI_14', 'MACD', 'BB_High', close_col]
+    df = df.dropna(subset=features_to_check)
     
     return df, close_col
 
 # Main App Execution
 st.title("📈 Stock Market Predictor")
-st.write("Upload your dataset (CSV) to train a Random Forest classifier and predict if the stock will go UP or DOWN the next day.")
+st.write("Enter a stock ticker to train a Random Forest classifier and predict if the stock will go UP or DOWN the next day.")
 
-uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+symbol = st.text_input("Enter Stock Ticker (e.g., AAPL, ^NSEI, INFY.NS)", value="AAPL")
 
-if uploaded_file is not None:
+if symbol:
     # 1. Load Data
-    st.subheader("Data Preview")
-    try:
-        raw_df = pd.read_csv(uploaded_file)
-        st.dataframe(raw_df.head())
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        st.stop()
+    st.subheader(f"Live Data Fetching for {symbol}")
+    with st.spinner("Fetching data from Yahoo Finance..."):
+        try:
+            ticker = yf.Ticker(symbol)
+            # Fetch 2 years of daily data
+            raw_df = ticker.history(period="2y")
+            
+            if raw_df.empty:
+                st.error(f"No data found for symbol '{symbol}'.")
+                st.stop()
+                
+            st.dataframe(raw_df.tail())
+            
+            # Fetch Recent News for Sentiment
+            news = ticker.news
+            if news:
+                st.subheader("Recent News Sentiment")
+                sentiments = []
+                for article in news[:5]:
+                    title = article.get('title', '')
+                    blob = TextBlob(title)
+                    sentiments.append(blob.sentiment.polarity)
+                    st.write(f"- {title} (Score: {blob.sentiment.polarity:.2f})")
+                
+                avg_sentiment = np.mean(sentiments) if sentiments else 0
+                st.write(f"**Average News Sentiment Score:** {avg_sentiment:.2f}")
+            else:
+                st.info("No recent news found for sentiment analysis.")
+                
+        except Exception as e:
+            st.error(f"Error fetching data: {e}")
+            st.stop()
         
     df, close_col = process_data(raw_df)
     
@@ -74,7 +104,7 @@ if uploaded_file is not None:
     st.dataframe(df.head())
 
     # 2. Extract Features and Target
-    features = ['SMA_10', 'SMA_30', 'Returns', close_col]
+    features = ['SMA_10', 'SMA_30', 'Returns', 'RSI_14', 'MACD', 'MACD_Signal', 'BB_High', 'BB_Low', close_col]
     X = df[features]
     y = df['Target']
     
@@ -112,23 +142,32 @@ if uploaded_file is not None:
         st.error("### 📉 Prediction: NOT BUY (Price expected to decrease/stay flat)")
 
     # 6. Visualization
-    st.subheader("Stock Price Visualization")
-    fig, ax = plt.subplots(figsize=(10, 5))
+    st.subheader("Interactive Stock Price Visualization")
     
-    if isinstance(df.index, pd.DatetimeIndex):
-        ax.plot(df.index, df[close_col], label='Closing Price', color='blue')
-        ax.plot(df.index, df['SMA_10'], label='10-Day SMA', color='orange', linestyle='--')
-        ax.plot(df.index, df['SMA_30'], label='30-Day SMA', color='red', linestyle='--')
-        ax.set_xlabel("Date")
-    else:
-        ax.plot(df[close_col].values, label='Closing Price', color='blue')
-        ax.plot(df['SMA_10'].values, label='10-Day SMA', color='orange', linestyle='--')
-        ax.plot(df['SMA_30'].values, label='30-Day SMA', color='red', linestyle='--')
-        ax.set_xlabel("Time Step")
-        
-    ax.set_ylabel("Price")
-    ax.set_title("Nifty 50 Closing Price & Moving Averages")
-    ax.legend()
-    st.pyplot(fig)
+    fig = go.Figure()
+    
+    # Candlestick
+    fig.add_trace(go.Candlestick(x=df.index,
+                open=df['Open'] if 'Open' in df.columns else df[close_col],
+                high=df['High'] if 'High' in df.columns else df[close_col],
+                low=df['Low'] if 'Low' in df.columns else df[close_col],
+                close=df[close_col],
+                name='Price'))
+                
+    # Moving Averages
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_10'], line=dict(color='orange', width=1.5), name='10-Day SMA'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_30'], line=dict(color='red', width=1.5), name='30-Day SMA'))
+    
+    # Bollinger Bands
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_High'], line=dict(color='gray', width=1, dash='dash'), name='BB High'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Low'], line=dict(color='gray', width=1, dash='dash'), name='BB Low', fill='tonexty'))
+
+    fig.update_layout(title=f"{symbol} Stock Price & Indicators",
+                      yaxis_title='Price',
+                      xaxis_title='Date',
+                      xaxis_rangeslider_visible=False,
+                      template="plotly_dark")
+                      
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("Awaiting CSV file to be uploaded.")
+    st.info("Please enter a stock ticker to begin.")
